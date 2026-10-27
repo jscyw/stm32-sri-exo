@@ -1,0 +1,294 @@
+#include "stm32f10x.h"
+
+#define ADS1115_ADDR_W   0x90
+#define ADS1115_ADDR_R   0x91
+
+#define ADS1115_REG_CONVERSION  0x00
+#define ADS1115_REG_CONFIG      0x01
+
+#define STM32_CAN_ID  0x285   // 已经验证能跑通的ID
+
+volatile uint32_t g_ms = 0;
+
+void RCC_Config(void);
+void GPIO_Config(void);
+void I2C1_Config(void);
+void CAN_Config(void);
+void SysTick_Config_ms(void);
+
+void I2C_WriteReg16(uint8_t devAddr, uint8_t reg, uint16_t data);
+uint16_t I2C_ReadReg16(uint8_t devAddr, uint8_t reg);
+
+void ADS1115_Config_SingleEnded_A0(void);
+int16_t ADS1115_ReadRaw(void);
+float ADS1115_RawToVoltage(int16_t raw);
+
+void CAN_Send_ADS1115_Frame(int16_t raw, int16_t mv, uint8_t counter);
+
+void delay_ms(uint32_t ms);
+
+int main(void)
+{
+    int16_t raw;
+    float voltage;
+    int16_t mv;
+    uint8_t counter = 0;
+    uint32_t last_tick = 0;
+
+    RCC_Config();
+    GPIO_Config();
+    I2C1_Config();
+    CAN_Config();
+    SysTick_Config_ms();
+
+    while (1)
+    {
+        // 每10ms执行一次 = 100Hz
+        if ((g_ms - last_tick) >= 10)
+        {
+            last_tick = g_ms;
+
+            // 启动一次 ADS1115 A0 单端转换
+            ADS1115_Config_SingleEnded_A0();
+
+            // ADS1115 在 128SPS 时，单次转换时间约 7.8ms
+            delay_ms(8);
+
+            // 读取原始值
+            raw = ADS1115_ReadRaw();
+
+            // 换算电压（当前量程 ±4.096V）
+            voltage = ADS1115_RawToVoltage(raw);
+
+            // 转毫伏
+            mv = (int16_t)(voltage * 1000.0f);
+
+            // 通过 CAN 发送
+            CAN_Send_ADS1115_Frame(raw, mv, counter);
+
+            counter++;
+        }
+    }
+}
+
+
+
+void SysTick_Config_ms(void)
+{
+    SysTick_Config(SystemCoreClock / 1000);   // 1ms中断
+}
+
+void delay_ms(uint32_t ms)
+{
+    uint32_t start = g_ms;
+    while ((g_ms - start) < ms);
+}
+
+void RCC_Config(void)
+{
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA |
+                           RCC_APB2Periph_GPIOB |
+                           RCC_APB2Periph_AFIO, ENABLE);
+
+    RCC_APB1PeriphClockCmd(RCC_APB1Periph_I2C1 |
+                           RCC_APB1Periph_CAN1, ENABLE);
+}
+
+void GPIO_Config(void)
+{
+    GPIO_InitTypeDef GPIO_InitStructure;
+
+    // I2C1: PB6=SCL, PB7=SDA
+    GPIO_InitStructure.GPIO_Pin = GPIO_Pin_6 | GPIO_Pin_7;
+    GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AF_OD;
+    GPIO_Init(GPIOB, &GPIO_InitStructure);
+
+    // CAN RX -> PA11
+    GPIO_InitStructure.GPIO_Pin = GPIO_Pin_11;
+    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IPU;
+    GPIO_Init(GPIOA, &GPIO_InitStructure);
+
+    // CAN TX -> PA12
+    GPIO_InitStructure.GPIO_Pin = GPIO_Pin_12;
+    GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AF_PP;
+    GPIO_Init(GPIOA, &GPIO_InitStructure);
+}
+
+void I2C1_Config(void)
+{
+    I2C_InitTypeDef I2C_InitStructure;
+
+    I2C_DeInit(I2C1);
+
+    I2C_InitStructure.I2C_Mode = I2C_Mode_I2C;
+    I2C_InitStructure.I2C_DutyCycle = I2C_DutyCycle_2;
+    I2C_InitStructure.I2C_OwnAddress1 = 0x00;
+    I2C_InitStructure.I2C_Ack = I2C_Ack_Enable;
+    I2C_InitStructure.I2C_AcknowledgedAddress = I2C_AcknowledgedAddress_7bit;
+    I2C_InitStructure.I2C_ClockSpeed = 100000;
+    I2C_Init(I2C1, &I2C_InitStructure);
+
+    I2C_Cmd(I2C1, ENABLE);
+}
+
+void CAN_Config(void)
+{
+    CAN_InitTypeDef        CAN_InitStructure;
+    CAN_FilterInitTypeDef  CAN_FilterInitStructure;
+
+    CAN_DeInit(CAN1);
+    CAN_StructInit(&CAN_InitStructure);
+
+    CAN_InitStructure.CAN_TTCM = DISABLE;
+    CAN_InitStructure.CAN_ABOM = DISABLE;
+    CAN_InitStructure.CAN_AWUM = DISABLE;
+    CAN_InitStructure.CAN_NART = DISABLE;
+    CAN_InitStructure.CAN_RFLM = DISABLE;
+    CAN_InitStructure.CAN_TXFP = DISABLE;
+
+    CAN_InitStructure.CAN_Mode = CAN_Mode_Normal;
+
+    // 500 kbps @ APB1=36MHz
+    CAN_InitStructure.CAN_SJW = CAN_SJW_1tq;
+    CAN_InitStructure.CAN_BS1 = CAN_BS1_13tq;
+    CAN_InitStructure.CAN_BS2 = CAN_BS2_4tq;
+    CAN_InitStructure.CAN_Prescaler = 4;
+
+    CAN_Init(CAN1, &CAN_InitStructure);
+
+    // 过滤器：全接收
+    CAN_FilterInitStructure.CAN_FilterNumber = 0;
+    CAN_FilterInitStructure.CAN_FilterMode = CAN_FilterMode_IdMask;
+    CAN_FilterInitStructure.CAN_FilterScale = CAN_FilterScale_32bit;
+    CAN_FilterInitStructure.CAN_FilterIdHigh = 0x0000;
+    CAN_FilterInitStructure.CAN_FilterIdLow = 0x0000;
+    CAN_FilterInitStructure.CAN_FilterMaskIdHigh = 0x0000;
+    CAN_FilterInitStructure.CAN_FilterMaskIdLow = 0x0000;
+    CAN_FilterInitStructure.CAN_FilterFIFOAssignment = CAN_FIFO0;
+    CAN_FilterInitStructure.CAN_FilterActivation = ENABLE;
+    CAN_FilterInit(&CAN_FilterInitStructure);
+}
+
+void I2C_WriteReg16(uint8_t devAddr, uint8_t reg, uint16_t data)
+{
+    while (I2C_GetFlagStatus(I2C1, I2C_FLAG_BUSY));
+
+    I2C_GenerateSTART(I2C1, ENABLE);
+    while (!I2C_CheckEvent(I2C1, I2C_EVENT_MASTER_MODE_SELECT));
+
+    I2C_Send7bitAddress(I2C1, devAddr, I2C_Direction_Transmitter);
+    while (!I2C_CheckEvent(I2C1, I2C_EVENT_MASTER_TRANSMITTER_MODE_SELECTED));
+
+    I2C_SendData(I2C1, reg);
+    while (!I2C_CheckEvent(I2C1, I2C_EVENT_MASTER_BYTE_TRANSMITTED));
+
+    I2C_SendData(I2C1, (uint8_t)(data >> 8));
+    while (!I2C_CheckEvent(I2C1, I2C_EVENT_MASTER_BYTE_TRANSMITTED));
+
+    I2C_SendData(I2C1, (uint8_t)(data & 0xFF));
+    while (!I2C_CheckEvent(I2C1, I2C_EVENT_MASTER_BYTE_TRANSMITTED));
+
+    I2C_GenerateSTOP(I2C1, ENABLE);
+}
+
+uint16_t I2C_ReadReg16(uint8_t devAddr, uint8_t reg)
+{
+    uint8_t high, low;
+
+    while (I2C_GetFlagStatus(I2C1, I2C_FLAG_BUSY));
+
+    // 写寄存器地址
+    I2C_GenerateSTART(I2C1, ENABLE);
+    while (!I2C_CheckEvent(I2C1, I2C_EVENT_MASTER_MODE_SELECT));
+
+    I2C_Send7bitAddress(I2C1, devAddr, I2C_Direction_Transmitter);
+    while (!I2C_CheckEvent(I2C1, I2C_EVENT_MASTER_TRANSMITTER_MODE_SELECTED));
+
+    I2C_SendData(I2C1, reg);
+    while (!I2C_CheckEvent(I2C1, I2C_EVENT_MASTER_BYTE_TRANSMITTED));
+
+    // 重启进入读
+    I2C_GenerateSTART(I2C1, ENABLE);
+    while (!I2C_CheckEvent(I2C1, I2C_EVENT_MASTER_MODE_SELECT));
+
+    I2C_Send7bitAddress(I2C1, ADS1115_ADDR_R, I2C_Direction_Receiver);
+    while (!I2C_CheckEvent(I2C1, I2C_EVENT_MASTER_RECEIVER_MODE_SELECTED));
+
+    while (!I2C_CheckEvent(I2C1, I2C_EVENT_MASTER_BYTE_RECEIVED));
+    high = I2C_ReceiveData(I2C1);
+
+    I2C_AcknowledgeConfig(I2C1, DISABLE);
+    while (!I2C_CheckEvent(I2C1, I2C_EVENT_MASTER_BYTE_RECEIVED));
+    low = I2C_ReceiveData(I2C1);
+
+    I2C_GenerateSTOP(I2C1, ENABLE);
+    I2C_AcknowledgeConfig(I2C1, ENABLE);
+
+    return ((uint16_t)high << 8) | low;
+}
+
+void ADS1115_Config_SingleEnded_A0(void)
+{
+    /*
+       OS   = 1      启动单次转换
+       MUX  = 100    AIN0 对 GND（单端）
+       PGA  = 001    ±4.096V
+       MODE = 1      单次转换
+       DR   = 100    128 SPS
+       COMP = 0003   关闭比较器
+    */
+    uint16_t config = 0xC383;
+    I2C_WriteReg16(ADS1115_ADDR_W, ADS1115_REG_CONFIG, config);
+}
+
+int16_t ADS1115_ReadRaw(void)
+{
+    return (int16_t)I2C_ReadReg16(ADS1115_ADDR_W, ADS1115_REG_CONVERSION);
+}
+
+float ADS1115_RawToVoltage(int16_t raw)
+{
+    // PGA = ±4.096V
+    return raw * 4.096f / 32768.0f;
+}
+
+void CAN_Send_ADS1115_Frame(int16_t raw, int16_t mv, uint8_t counter)
+{
+    CanTxMsg TxMessage;
+    uint8_t mailbox;
+    uint8_t status;
+    volatile uint32_t timeout = 0xFFFF;
+
+    TxMessage.StdId = STM32_CAN_ID;
+    TxMessage.ExtId = 0x00;
+    TxMessage.IDE   = CAN_ID_STD;     // 标准帧
+    TxMessage.RTR   = CAN_RTR_DATA;
+    TxMessage.DLC   = 8;
+
+    // Byte0~1: raw
+    TxMessage.Data[0] = (raw >> 8) & 0xFF;
+    TxMessage.Data[1] = raw & 0xFF;
+
+    // Byte2~3: mV
+    TxMessage.Data[2] = (mv >> 8) & 0xFF;
+    TxMessage.Data[3] = mv & 0xFF;
+
+    // Byte4: counter
+    TxMessage.Data[4] = counter;
+
+    // Byte5~7
+    TxMessage.Data[5] = 0xA5;
+    TxMessage.Data[6] = 0x00;
+    TxMessage.Data[7] = 0x00;
+
+    mailbox = CAN_Transmit(CAN1, &TxMessage);
+
+    do
+    {
+        status = CAN_TransmitStatus(CAN1, mailbox);
+        timeout--;
+    }
+    while ((status == CAN_TxStatus_Pending) && (timeout > 0));
+}

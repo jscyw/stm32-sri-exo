@@ -1,0 +1,1335 @@
+#include "stm32f10x.h"
+#include <stdint.h>
+
+/*=========================================================
+  ADS8689 GPIO
+=========================================================*/
+
+#define ADS8689_CS_LOW()       GPIO_ResetBits(GPIOA, GPIO_Pin_4)
+#define ADS8689_CS_HIGH()      GPIO_SetBits(GPIOA, GPIO_Pin_4)
+
+#define ADS8689_RST_LOW()      GPIO_ResetBits(GPIOB, GPIO_Pin_1)
+#define ADS8689_RST_HIGH()     GPIO_SetBits(GPIOB, GPIO_Pin_1)
+
+#define ADS8689_RVS_READ()     GPIO_ReadInputDataBit(GPIOB, GPIO_Pin_0)
+
+/*=========================================================
+  ADS8689 参数
+=========================================================*/
+
+#define ADS8689_RANGE_REG              0x14
+
+/*
+ * ±0.625 × 4.096V
+ * = ±2.56V
+ */
+#define ADS8689_RANGE_BIPOLAR_2V56     0x0004
+
+/*=========================================================
+  CAN
+=========================================================*/
+
+#define STM32_CAN_ID       0x285
+
+/*=========================================================
+  环形缓冲区
+=========================================================*/
+
+/*
+ * 256个采样点
+ * 1kHz情况下约能缓存256ms
+ *
+ * 必须是2的幂，方便取模。
+ */
+#define ADC_BUFFER_SIZE    256
+
+typedef struct
+{
+    uint16_t raw;
+
+    /*
+     * 这是“真实ADC采样序号”
+     * 由TIM2中断产生。
+     *
+     * 不是CAN发送序号。
+     */
+    uint16_t sample_counter;
+
+} ADC_Sample_t;
+
+
+volatile ADC_Sample_t g_adc_buffer[ADC_BUFFER_SIZE];
+
+volatile uint16_t g_adc_head = 0;
+volatile uint16_t g_adc_tail = 0;
+
+
+/*=========================================================
+  调试统计
+=========================================================*/
+
+volatile uint32_t g_ms = 0;
+
+/* TIM2触发次数 */
+volatile uint32_t g_timer_count = 0;
+
+/* 成功进入缓冲区的ADC采样次数 */
+volatile uint32_t g_adc_count = 0;
+
+/* 环形缓冲区满，来不及处理 */
+volatile uint32_t g_buffer_overrun = 0;
+
+/* ADS8689在1ms到来时仍未完成转换 */
+volatile uint32_t g_adc_not_ready = 0;
+
+/* CAN发送失败 */
+volatile uint32_t g_can_fail = 0;
+
+/*
+ * 真正的ADC采样编号
+ *
+ * 每次TIM2采样事件+1。
+ */
+volatile uint16_t g_sample_counter = 0;
+
+
+/*=========================================================
+  函数声明
+=========================================================*/
+
+void RCC_Config(void);
+void GPIO_Config(void);
+void SPI1_Config(void);
+void CAN_Config(void);
+void TIM2_1000Hz_Config(void);
+void SysTick_Config_ms(void);
+
+void delay_ms(uint32_t ms);
+
+uint8_t SPI1_TransferByte(uint8_t data);
+uint32_t ADS8689_Transfer32(uint32_t tx);
+
+void ADS8689_Reset(void);
+void ADS8689_WriteHalfWord(uint16_t address, uint16_t data);
+void ADS8689_Init(void);
+
+/*
+ * 中断使用：
+ * 不进行长时间等待。
+ */
+uint16_t ADS8689_ReadConversion_ISR(void);
+
+/* main使用 */
+int32_t ADS8689_RawToMicrovolt(uint16_t raw);
+
+void CAN_Send_ADS8689_Frame(
+        uint16_t raw,
+        int32_t voltage_uV,
+        uint16_t sample_counter);
+
+/*=========================================================
+  main
+=========================================================*/
+
+int main(void)
+{
+    uint16_t raw;
+
+    uint16_t sample_counter;
+
+    int32_t voltage_uV;
+
+
+    RCC_Config();
+
+    GPIO_Config();
+
+    SPI1_Config();
+
+    CAN_Config();
+
+    SysTick_Config_ms();
+
+
+    /*-----------------------------------------
+      ADS8689初始化
+    -----------------------------------------*/
+
+    ADS8689_Init();
+
+
+    /*
+     * 先产生一个SPI帧。
+     *
+     * 这一次返回值丢弃，
+     * CS上升沿开始第一次正式转换。
+     */
+
+    (void)ADS8689_Transfer32(
+        0x00000000UL
+    );
+
+
+    /*
+     * 给第一次转换足够时间完成。
+     */
+    delay_ms(1);
+
+
+    /*-----------------------------------------
+      启动1kHz TIM2
+    -----------------------------------------*/
+
+    TIM2_1000Hz_Config();
+
+
+    /*=====================================================
+      main只负责：
+      缓冲区 -> 电压计算 -> CAN发送
+    =====================================================*/
+
+    while (1)
+    {
+        /*
+         * 缓冲区非空
+         */
+        if (g_adc_tail != g_adc_head)
+        {
+            /*
+             * 取出一帧。
+             *
+             * ISR只修改head，
+             * main只修改tail，
+             * 因此这里无需长时间关闭中断。
+             */
+
+            raw =
+                g_adc_buffer[
+                    g_adc_tail
+                ].raw;
+
+
+            sample_counter =
+                g_adc_buffer[
+                    g_adc_tail
+                ].sample_counter;
+
+
+            /*
+             * tail向前移动
+             */
+
+            g_adc_tail =
+                (g_adc_tail + 1)
+                &
+                (ADC_BUFFER_SIZE - 1);
+
+
+            /*
+             * 电压计算放在main里，
+             * 不占用TIM2中断时间。
+             */
+
+            voltage_uV =
+                ADS8689_RawToMicrovolt(
+                    raw
+                );
+
+
+            /*
+             * CAN发送
+             */
+
+            CAN_Send_ADS8689_Frame(
+                raw,
+                voltage_uV,
+                sample_counter
+            );
+        }
+    }
+}
+
+
+/*=========================================================
+  RCC
+=========================================================*/
+
+void RCC_Config(void)
+{
+    RCC_APB2PeriphClockCmd(
+        RCC_APB2Periph_GPIOA |
+        RCC_APB2Periph_GPIOB |
+        RCC_APB2Periph_AFIO  |
+        RCC_APB2Periph_SPI1,
+        ENABLE
+    );
+
+
+    RCC_APB1PeriphClockCmd(
+        RCC_APB1Periph_TIM2 |
+        RCC_APB1Periph_CAN1,
+        ENABLE
+    );
+}
+
+
+/*=========================================================
+  GPIO
+=========================================================*/
+
+void GPIO_Config(void)
+{
+    GPIO_InitTypeDef gpio;
+
+
+    /*=====================================================
+      PA4：ADS8689 CS
+    =====================================================*/
+
+    gpio.GPIO_Pin =
+        GPIO_Pin_4;
+
+    gpio.GPIO_Speed =
+        GPIO_Speed_50MHz;
+
+    gpio.GPIO_Mode =
+        GPIO_Mode_Out_PP;
+
+    GPIO_Init(
+        GPIOA,
+        &gpio
+    );
+
+    ADS8689_CS_HIGH();
+
+
+    /*=====================================================
+      PA5：SPI1 SCLK
+      PA7：SPI1 MOSI
+    =====================================================*/
+
+    gpio.GPIO_Pin =
+        GPIO_Pin_5 |
+        GPIO_Pin_7;
+
+    gpio.GPIO_Speed =
+        GPIO_Speed_50MHz;
+
+    gpio.GPIO_Mode =
+        GPIO_Mode_AF_PP;
+
+    GPIO_Init(
+        GPIOA,
+        &gpio
+    );
+
+
+    /*=====================================================
+      PA6：SPI1 MISO
+    =====================================================*/
+
+    gpio.GPIO_Pin =
+        GPIO_Pin_6;
+
+    gpio.GPIO_Mode =
+        GPIO_Mode_IN_FLOATING;
+
+    GPIO_Init(
+        GPIOA,
+        &gpio
+    );
+
+
+    /*=====================================================
+      PB0：ADS8689 RVS
+    =====================================================*/
+
+    gpio.GPIO_Pin =
+        GPIO_Pin_0;
+
+    gpio.GPIO_Mode =
+        GPIO_Mode_IN_FLOATING;
+
+    GPIO_Init(
+        GPIOB,
+        &gpio
+    );
+
+
+    /*=====================================================
+      PB1：ADS8689 RESET
+    =====================================================*/
+
+    gpio.GPIO_Pin =
+        GPIO_Pin_1;
+
+    gpio.GPIO_Speed =
+        GPIO_Speed_50MHz;
+
+    gpio.GPIO_Mode =
+        GPIO_Mode_Out_PP;
+
+    GPIO_Init(
+        GPIOB,
+        &gpio
+    );
+
+    ADS8689_RST_HIGH();
+
+
+    /*=====================================================
+      PA11：CAN_RX
+    =====================================================*/
+
+    gpio.GPIO_Pin =
+        GPIO_Pin_11;
+
+    gpio.GPIO_Mode =
+        GPIO_Mode_IPU;
+
+    GPIO_Init(
+        GPIOA,
+        &gpio
+    );
+
+
+    /*=====================================================
+      PA12：CAN_TX
+    =====================================================*/
+
+    gpio.GPIO_Pin =
+        GPIO_Pin_12;
+
+    gpio.GPIO_Speed =
+        GPIO_Speed_50MHz;
+
+    gpio.GPIO_Mode =
+        GPIO_Mode_AF_PP;
+
+    GPIO_Init(
+        GPIOA,
+        &gpio
+    );
+}
+
+
+/*=========================================================
+  SPI1
+=========================================================*/
+
+void SPI1_Config(void)
+{
+    SPI_InitTypeDef spi;
+
+
+    SPI_I2S_DeInit(
+        SPI1
+    );
+
+
+    spi.SPI_Direction =
+        SPI_Direction_2Lines_FullDuplex;
+
+    spi.SPI_Mode =
+        SPI_Mode_Master;
+
+    spi.SPI_DataSize =
+        SPI_DataSize_8b;
+
+
+    /*
+     * ADS8689标准SPI：
+     *
+     * CPOL = 0
+     * CPHA = 0
+     */
+
+    spi.SPI_CPOL =
+        SPI_CPOL_Low;
+
+    spi.SPI_CPHA =
+        SPI_CPHA_1Edge;
+
+
+    spi.SPI_NSS =
+        SPI_NSS_Soft;
+
+
+    /*
+     * STM32F103 SPI1
+     *
+     * PCLK2 = 72MHz
+     *
+     * 72MHz / 16
+     * = 4.5MHz
+     *
+     * 32bit传输约7.1us。
+     */
+
+    spi.SPI_BaudRatePrescaler =
+        SPI_BaudRatePrescaler_16;
+
+
+    spi.SPI_FirstBit =
+        SPI_FirstBit_MSB;
+
+
+    spi.SPI_CRCPolynomial =
+        7;
+
+
+    SPI_Init(
+        SPI1,
+        &spi
+    );
+
+
+    SPI_Cmd(
+        SPI1,
+        ENABLE
+    );
+}
+
+
+/*=========================================================
+  SPI发送/接收1Byte
+=========================================================*/
+
+uint8_t SPI1_TransferByte(uint8_t data)
+{
+    uint32_t timeout;
+
+
+    timeout = 10000;
+
+
+    while (
+        SPI_I2S_GetFlagStatus(
+            SPI1,
+            SPI_I2S_FLAG_TXE
+        )
+        ==
+        RESET
+    )
+    {
+        if (--timeout == 0)
+        {
+            return 0;
+        }
+    }
+
+
+    SPI_I2S_SendData(
+        SPI1,
+        data
+    );
+
+
+    timeout = 10000;
+
+
+    while (
+        SPI_I2S_GetFlagStatus(
+            SPI1,
+            SPI_I2S_FLAG_RXNE
+        )
+        ==
+        RESET
+    )
+    {
+        if (--timeout == 0)
+        {
+            return 0;
+        }
+    }
+
+
+    return
+        (uint8_t)
+        SPI_I2S_ReceiveData(
+            SPI1
+        );
+}
+
+
+/*=========================================================
+  ADS8689 32bit SPI帧
+=========================================================*/
+
+uint32_t ADS8689_Transfer32(uint32_t tx)
+{
+    uint32_t rx;
+
+
+    rx = 0;
+
+
+    ADS8689_CS_LOW();
+
+
+    rx |=
+        ((uint32_t)
+        SPI1_TransferByte(
+            (uint8_t)(tx >> 24)
+        ))
+        << 24;
+
+
+    rx |=
+        ((uint32_t)
+        SPI1_TransferByte(
+            (uint8_t)(tx >> 16)
+        ))
+        << 16;
+
+
+    rx |=
+        ((uint32_t)
+        SPI1_TransferByte(
+            (uint8_t)(tx >> 8)
+        ))
+        << 8;
+
+
+    rx |=
+        (uint32_t)
+        SPI1_TransferByte(
+            (uint8_t)tx
+        );
+
+
+    /*
+     * 等真正SPI发送结束
+     */
+
+    while (
+        SPI_I2S_GetFlagStatus(
+            SPI1,
+            SPI_I2S_FLAG_BSY
+        )
+        ==
+        SET
+    )
+    {
+    }
+
+
+    /*
+     * CS上升：
+     *
+     * 结束当前数据读取；
+     * 同时开始下一次ADC转换。
+     */
+
+    ADS8689_CS_HIGH();
+
+
+    return rx;
+}
+
+
+/*=========================================================
+  ADS8689 RESET
+=========================================================*/
+
+void ADS8689_Reset(void)
+{
+    ADS8689_RST_LOW();
+
+    delay_ms(1);
+
+
+    ADS8689_RST_HIGH();
+
+    delay_ms(25);
+}
+
+
+/*=========================================================
+  ADS8689写16bit寄存器
+=========================================================*/
+
+void ADS8689_WriteHalfWord(
+    uint16_t address,
+    uint16_t data)
+
+{
+    uint32_t command;
+
+
+    command =
+        0xD0000000UL
+        |
+        (
+            ((uint32_t)address
+             & 0x01FFUL)
+            << 16
+        )
+        |
+        (uint32_t)data;
+
+
+    (void)ADS8689_Transfer32(
+        command
+    );
+}
+
+/*=========================================================
+  ADS8689读取16位寄存器
+
+  READ_HWORD：
+  当前帧发送读取命令
+  下一帧才返回16bit寄存器内容
+=========================================================*/
+
+uint16_t ADS8689_ReadHalfWord(uint16_t address)
+{
+    uint32_t command;
+    uint32_t rx;
+
+    /*
+     * READ_HWORD：
+     *
+     * opcode = 11001
+     *
+     * 对 RANGE_SEL_REG = 0x14：
+     *
+     * 实际命令应为：
+     *
+     * C8 14 00 00
+     *
+     * 即：
+     *
+     * 0xC8140000
+     */
+
+    command =
+        0xC8000000UL |
+        (((uint32_t)address & 0x01FFUL) << 16);
+
+    /*
+     * Frame F：
+     * 发送READ_HWORD命令
+     *
+     * 当前返回值不是我们需要的寄存器值，
+     * 所以直接丢弃。
+     */
+    (void)ADS8689_Transfer32(command);
+
+    /*
+     * Frame F+1：
+     * 发送NOP产生32个SCLK，
+     * ADS8689此时输出上一帧请求的寄存器数据。
+     */
+    rx = ADS8689_Transfer32(0x00000000UL);
+
+    /*
+     * READ_HWORD返回16位寄存器值。
+     *
+     * 默认情况下位于输出32bit中的高16位。
+     */
+    return (uint16_t)(rx >> 16);
+}
+
+/*=========================================================
+  ADS8689初始化
+=========================================================*/
+
+volatile uint16_t g_ads8689_range_readback = 0;
+volatile uint8_t  g_ads8689_range_ok = 0;
+
+void ADS8689_Init(void)
+{
+    ADS8689_Reset();
+
+    /*
+     * 写入：
+     * RANGE_SEL_REG = 0x0004
+     *
+     * ±0.625 × 4.096V
+     * = ±2.56V
+     */
+    ADS8689_WriteHalfWord(
+        ADS8689_RANGE_REG,
+        ADS8689_RANGE_BIPOLAR_2V56
+    );
+
+    delay_ms(2);
+
+    /*
+     * 读回0x14寄存器
+     */
+    g_ads8689_range_readback =
+        ADS8689_ReadHalfWord(
+            ADS8689_RANGE_REG
+        );
+
+    /*
+     * RANGE_SEL位在低4位。
+     *
+     * 期望：
+     * xxxx xxxx xxxx 0100
+     */
+    if (
+        (g_ads8689_range_readback & 0x000F)
+        ==
+        ADS8689_RANGE_BIPOLAR_2V56
+    )
+    {
+        g_ads8689_range_ok = 1;
+    }
+    else
+    {
+        g_ads8689_range_ok = 0;
+    }
+
+    delay_ms(2);
+}
+
+/*=========================================================
+  TIM2 ISR调用
+=========================================================*/
+
+uint16_t ADS8689_ReadConversion_ISR(void)
+{
+    uint32_t rx;
+
+
+    /*
+     * 在1kHz模式下，
+     * 上一次转换已经进行了约1ms。
+     *
+     * ADS8689最大100kSPS，
+     * 所以正常情况下RVS早已变高。
+     *
+     * ISR里不进行长时间while等待。
+     */
+
+    if (
+        ADS8689_RVS_READ()
+        ==
+        Bit_RESET
+    )
+    {
+        /*
+         * ADC还没有ready。
+         */
+
+        g_adc_not_ready++;
+
+        /*
+         * 返回0只是错误保护。
+         *
+         * 正常情况下这个计数应该始终为0。
+         */
+        return 0;
+    }
+
+
+    /*
+     * 读取上一转换结果。
+     *
+     * 本次SPI结束，
+     * CS上升启动下一次转换。
+     */
+
+    rx =
+        ADS8689_Transfer32(
+            0x00000000UL
+        );
+
+
+    /*
+     * 默认16位转换结果在高16bit
+     */
+
+    return
+        (uint16_t)(
+            rx >> 16
+        );
+}
+
+
+/*=========================================================
+  RAW -> μV
+=========================================================*/
+
+int32_t ADS8689_RawToMicrovolt(
+    uint16_t raw)
+{
+    int32_t code;
+
+    int32_t voltage_uV;
+
+
+    /*
+     * ±2.56V
+     *
+     * ADS8689双极性输出：
+     *
+     * 0x0000 -> -2.56V
+     * 0x8000 ->  0V
+     * 0xFFFF -> 接近+2.56V
+     */
+
+    code =
+        (int32_t)raw
+        -
+        32768;
+
+
+    /*
+     * 总量程5.12V
+     *
+     * 5.12V / 65536
+     *
+     * = 78.125μV
+     *
+     * = 625 / 8
+     */
+
+
+    if (code >= 0)
+    {
+        voltage_uV =
+            (
+                code * 625
+                +
+                4
+            )
+            /
+            8;
+    }
+    else
+    {
+        voltage_uV =
+            (
+                code * 625
+                -
+                4
+            )
+            /
+            8;
+    }
+
+
+    return voltage_uV;
+}
+
+
+/*=========================================================
+  TIM2：1000Hz
+=========================================================*/
+
+void TIM2_1000Hz_Config(void)
+{
+    TIM_TimeBaseInitTypeDef tim;
+
+    NVIC_InitTypeDef nvic;
+
+
+    /*
+     * STM32F103：
+     *
+     * APB1 = 36MHz
+     *
+     * TIM2 clock = 72MHz
+     *
+     * 72MHz
+     * / 7200
+     * / 10
+     *
+     * = 1000Hz
+     */
+
+
+    tim.TIM_Prescaler =
+        7200 - 1;
+
+
+    tim.TIM_Period =
+        10 - 1;
+
+
+    tim.TIM_ClockDivision =
+        TIM_CKD_DIV1;
+
+
+    tim.TIM_CounterMode =
+        TIM_CounterMode_Up;
+
+
+    tim.TIM_RepetitionCounter =
+        0;
+
+
+    TIM_TimeBaseInit(
+        TIM2,
+        &tim
+    );
+
+
+    TIM_ClearITPendingBit(
+        TIM2,
+        TIM_IT_Update
+    );
+
+
+    TIM_ITConfig(
+        TIM2,
+        TIM_IT_Update,
+        ENABLE
+    );
+
+
+    /*
+     * ADC采样中断优先级建议比其它普通任务高。
+     */
+
+    nvic.NVIC_IRQChannel =
+        TIM2_IRQn;
+
+
+    nvic.NVIC_IRQChannelPreemptionPriority =
+        0;
+
+
+    nvic.NVIC_IRQChannelSubPriority =
+        0;
+
+
+    nvic.NVIC_IRQChannelCmd =
+        ENABLE;
+
+
+    NVIC_Init(
+        &nvic
+    );
+
+
+    TIM_Cmd(
+        TIM2,
+        ENABLE
+    );
+}
+
+
+/*=========================================================
+  CAN：500kbps
+=========================================================*/
+
+void CAN_Config(void)
+{
+    CAN_InitTypeDef can;
+
+    CAN_FilterInitTypeDef filter;
+
+
+    CAN_DeInit(
+        CAN1
+    );
+
+
+    CAN_StructInit(
+        &can
+    );
+
+
+    can.CAN_TTCM =
+        DISABLE;
+
+
+    can.CAN_ABOM =
+        ENABLE;
+
+
+    can.CAN_AWUM =
+        DISABLE;
+
+
+    can.CAN_NART =
+        DISABLE;
+
+
+    can.CAN_RFLM =
+        DISABLE;
+
+
+    can.CAN_TXFP =
+        DISABLE;
+
+
+    can.CAN_Mode =
+        CAN_Mode_Normal;
+
+
+    /*
+     * 36MHz / 4 / 18
+     * = 500kbps
+     */
+
+    can.CAN_SJW =
+        CAN_SJW_1tq;
+
+
+    can.CAN_BS1 =
+        CAN_BS1_13tq;
+
+
+    can.CAN_BS2 =
+        CAN_BS2_4tq;
+
+
+    can.CAN_Prescaler =
+        4;
+
+
+    CAN_Init(
+        CAN1,
+        &can
+    );
+
+
+    /* 全接收过滤器 */
+
+    filter.CAN_FilterNumber =
+        0;
+
+
+    filter.CAN_FilterMode =
+        CAN_FilterMode_IdMask;
+
+
+    filter.CAN_FilterScale =
+        CAN_FilterScale_32bit;
+
+
+    filter.CAN_FilterIdHigh =
+        0;
+
+
+    filter.CAN_FilterIdLow =
+        0;
+
+
+    filter.CAN_FilterMaskIdHigh =
+        0;
+
+
+    filter.CAN_FilterMaskIdLow =
+        0;
+
+
+    filter.CAN_FilterFIFOAssignment =
+        CAN_FIFO0;
+
+
+    filter.CAN_FilterActivation =
+        ENABLE;
+
+
+    CAN_FilterInit(
+        &filter
+    );
+}
+
+
+/*=========================================================
+  CAN发送
+
+  Byte0~1 : RAW
+  Byte2~5 : int32 μV
+  Byte6~7 : ADC真实采样序号
+=========================================================*/
+
+void CAN_Send_ADS8689_Frame(
+    uint16_t raw,
+    int32_t voltage_uV,
+    uint16_t sample_counter)
+{
+    CanTxMsg tx;
+
+    uint8_t mailbox;
+
+    uint8_t status;
+
+    uint32_t timeout;
+
+
+    timeout = 10000;
+
+
+    tx.StdId =
+        STM32_CAN_ID;
+
+
+    tx.ExtId =
+        0;
+
+
+    tx.IDE =
+        CAN_ID_STD;
+
+
+    tx.RTR =
+        CAN_RTR_DATA;
+
+
+    tx.DLC =
+        8;
+
+
+    /* RAW */
+
+    tx.Data[0] =
+        (uint8_t)(
+            raw >> 8
+        );
+
+
+    tx.Data[1] =
+        (uint8_t)raw;
+
+
+    /* int32 voltage_uV */
+
+    tx.Data[2] =
+        (uint8_t)(
+            ((uint32_t)voltage_uV)
+            >> 24
+        );
+
+
+    tx.Data[3] =
+        (uint8_t)(
+            ((uint32_t)voltage_uV)
+            >> 16
+        );
+
+
+    tx.Data[4] =
+        (uint8_t)(
+            ((uint32_t)voltage_uV)
+            >> 8
+        );
+
+
+    tx.Data[5] =
+        (uint8_t)(
+            (uint32_t)voltage_uV
+        );
+
+
+    /*
+     * 真正的ADC采样序号
+     */
+
+    tx.Data[6] =
+        (uint8_t)(
+            sample_counter >> 8
+        );
+
+
+    tx.Data[7] =
+        (uint8_t)
+        sample_counter;
+
+
+    mailbox =
+        CAN_Transmit(
+            CAN1,
+            &tx
+        );
+
+
+    /*
+     * CAN_Transmit没有可用邮箱
+     */
+
+    if (
+        mailbox
+        ==
+        CAN_TxStatus_NoMailBox
+    )
+    {
+        g_can_fail++;
+
+        return;
+    }
+
+
+    do
+    {
+        status =
+            CAN_TransmitStatus(
+                CAN1,
+                mailbox
+            );
+
+
+        timeout--;
+
+    }
+    while (
+        (
+            status
+            ==
+            CAN_TxStatus_Pending
+        )
+        &&
+        (
+            timeout > 0
+        )
+    );
+
+
+    if (
+        status
+        !=
+        CAN_TxStatus_Ok
+    )
+    {
+        g_can_fail++;
+    }
+}
+
+
+/*=========================================================
+  SysTick
+=========================================================*/
+
+void SysTick_Config_ms(void)
+{
+    SysTick_Config(
+        SystemCoreClock
+        /
+        1000
+    );
+}
+
+
+/*=========================================================
+  delay
+=========================================================*/
+
+void delay_ms(uint32_t ms)
+{
+    uint32_t start;
+
+
+    start =
+        g_ms;
+
+
+    while (
+        (
+            g_ms
+            -
+            start
+        )
+        <
+        ms
+    )
+    {
+    }
+}
